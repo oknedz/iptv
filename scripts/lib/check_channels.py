@@ -54,7 +54,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import quote, urljoin, urlparse, urlsplit, urlunsplit
 
 import http.client
 import urllib.error
@@ -652,7 +652,7 @@ def probe_hls(
     Returns ``(verdict, detail, info)``.
     """
     request = urllib.request.Request(
-        url,
+        safe_url(url),
         headers={"User-Agent": cfg.user_agent, "Accept": "*/*", "Accept-Encoding": "identity"},
     )
     try:
@@ -794,6 +794,24 @@ def _looks_like_error_document(content_type: str, body: bytes) -> bool:
     return head[:64].lower().startswith((b"<!doctype", b"<html", b"<?xml"))
 
 
+def safe_url(url: str) -> str:
+    """Percent-encode a URL so http.client can send it.
+
+    Playlists contain non-ASCII paths (Thai channel names appear in URLs such
+    as ``/Transcoder/มายาHD.stream_576p/playlist.m3u8``).  http.client
+    encodes the request target as ASCII and raises UnicodeEncodeError, which
+    the verdict taxonomy then reports as UNKNOWN-ERROR -- i.e. a working
+    channel is scored as an unclassifiable failure.  Encoding the path and
+    query up front fixes that and is what a browser does anyway.
+    """
+    parts = urlsplit(url)
+    if parts.scheme in ("", "file") and not parts.netloc:
+        return url
+    path = quote(parts.path, safe="/%:@&=+$,;~!*'()[]-._")
+    query = quote(parts.query, safe="=&?/:;%+@$,~!*'()[]-._")
+    return urlunsplit((parts.scheme, parts.netloc, path, query, parts.fragment))
+
+
 def probe_range_get(url: str, cfg: "Config") -> Tuple[str, str, Dict[str, object]]:
     """Issue a short ranged GET and describe what came back.
 
@@ -811,7 +829,7 @@ def probe_range_get(url: str, cfg: "Config") -> Tuple[str, str, Dict[str, object
         "Accept-Encoding": "identity",
         "Range": f"bytes=0-{RANGE_BYTES - 1}",
     }
-    request = urllib.request.Request(url, headers=headers)
+    request = urllib.request.Request(safe_url(url), headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=cfg.timeout) as response:
             status = response.getcode()

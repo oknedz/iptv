@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import re
 import os
 import sys
 from collections import Counter, defaultdict
@@ -173,6 +174,72 @@ def render_playlist(header: str, entries: Iterable[Sequence[str]]) -> str:
     return "\n".join(out) + "\n"
 
 
+def normalise_name(name: str) -> str:
+    """Collapse a channel name to a key for finding another source.
+
+    The same channel appears under several entries with a quality suffix
+    ("(1080p)"), a restriction label ("[Geo-blocked]") or slightly different
+    punctuation.  Matching on the bare words is what lets a dead entry be
+    replaced by a live one for the *same* channel.
+    """
+    text = re.sub(r"\([^)]*\)", " ", name or "")
+    text = re.sub(r"\[[^\]]*\]", " ", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text.lower())
+    return " ".join(text.split())
+
+
+def find_alternates(channels: List["cc.Channel"], by_index: Dict[int, "cc.ProbeResult"],
+                    all_lines: Sequence[str]) -> Dict[int, int]:
+    """Map dead channel index -> index of a live entry for the same channel.
+
+    A provider retiring one of its own feeds does not mean the channel is
+    gone: this catalogue carries many channels from several providers, so a
+    404 here is often a dead *source*, not a dead *channel*.  Only entries
+    that actually answered in this same run are eligible, so a substitution
+    can never be a guess.
+    """
+    live: Dict[str, List["cc.Channel"]] = defaultdict(list)
+    for channel in channels:
+        result = by_index.get(channel.index)
+        if result and result.verdict in PLAYABLE:
+            live[normalise_name(channel.name)].append(channel)
+
+    chosen: Dict[int, int] = {}
+    for channel in channels:
+        result = by_index.get(channel.index)
+        if not result or result.verdict in PLAYABLE:
+            continue
+        candidates = [c for c in live.get(normalise_name(channel.name), [])
+                      if c.index != channel.index]
+        if not candidates:
+            continue
+        candidates.sort(key=lambda c: (by_index[c.index].verdict != "OK",
+                                       by_index[c.index].seconds))
+        chosen[channel.index] = candidates[0].index
+    return chosen
+
+
+def entry_with_name(entry: Sequence[str], name: str) -> List[str]:
+    """Return ``entry`` with its #EXTINF display name replaced by ``name``.
+
+    Everything else is kept verbatim - logo, group, and the EXTVLCOPT header
+    lines the live source needs.  Dropping those headers is the usual reason
+    a substituted stream still refuses to play.
+    """
+    lines = list(entry)
+    header = lines[0]
+    term = ""
+    body = header
+    for suffix in ("\r\n", "\n"):
+        if body.endswith(suffix):
+            body, term = body[: -len(suffix)], suffix
+            break
+    if "," in body:
+        body = body[: body.rindex(",") + 1] + name
+    lines[0] = body + term
+    return lines
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -183,6 +250,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--no-ffprobe", action="store_true")
     parser.add_argument("--no-ua-probe", action="store_true",
                         help="skip the second pass that tries to unblock 403s")
+    parser.add_argument("--find-alternates", action="store_true",
+                        help="replace a dead source with a live one for the same channel")
     parser.add_argument("--apply-redirects", action="store_true",
                         help="pin redirect targets, keeping any |option tail")
     parser.add_argument("--out-dir", default=OUT_DIR)
@@ -234,6 +303,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             result.detail = f"unblocked by user-agent: {note}"
             channel.ua_fix = ua
 
+    alternates: Dict[int, int] = {}
+    if args.find_alternates:
+        alternates = find_alternates(channels, by_index, all_lines)
+        print(f"found a live alternate source for {len(alternates)} dead channel(s)", file=sys.stderr)
+        for dead_index, live_index in alternates.items():
+            by_index[dead_index].verdict = "OK"
+            by_index[dead_index].detail = (
+                f"dead source replaced by a live one for the same channel: {channels[live_index].url}")
+
     verified: List[List[str]] = []
     blocked: List[List[str]] = []
     reasons: Counter = Counter()
@@ -241,6 +319,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     geo = 0
     dead = 0
     repaired = 0
+    substituted = 0
 
     for channel in channels:
         result = by_index.get(channel.index)
@@ -252,6 +331,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         hosts[host][verdict] += 1
 
         entry = entry_lines(all_lines, channel)
+        if channel.index in alternates:
+            alt = channels[alternates[channel.index]]
+            entry = entry_with_name(entry_lines(all_lines, alt), channel.name)
+            substituted += 1
         if getattr(channel, "ua_fix", ""):
             repaired += 1
             name = channel.name
@@ -309,7 +392,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"- **Playable: {playable}/{total} ({100.0 * playable / max(total, 1):.1f}%)**",
         f"- Geo-blocked: {geo} (needs a VPN or a proxy, not a playlist edit)",
         f"- Dead links: {dead} (retired token, wrong path, dead host, refused)",
-        f"- Repaired while verifying: {unblocked} unblocked by User-Agent, {repaired} entries rewritten",
+        f"- Repaired while verifying: {unblocked} unblocked by User-Agent, "
+        f"{repaired} entries rewritten, {substituted} dead sources replaced by a live "
+        f"source for the same channel",
         "",
         "## Verdicts",
         "",
@@ -342,7 +427,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         handle.write("\n".join(lines) + "\n")
 
     print(f"playable {playable}/{total}  geo-blocked {geo}  dead {dead}  "
-          f"ua-unblocked {unblocked}", file=sys.stderr)
+          f"ua-unblocked {unblocked}  alternate-source {substituted}", file=sys.stderr)
     print(f"wrote {verified_path}\n      {blocked_path}\n      {report_path}", file=sys.stderr)
     return 0
 
