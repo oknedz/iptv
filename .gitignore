@@ -7,3 +7,6 @@ node_modules
 /.api/
 .env
 /temp/
+# python bytecode
+__pycache__/
+*.pyc
