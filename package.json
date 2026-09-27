@@ -18,6 +18,7 @@
     "playlist:export": "tsx scripts/commands/playlist/export.ts",
     "readme:update": "tsx scripts/commands/readme/update.ts",
     "report:create": "tsx scripts/commands/report/create.ts",
+    "playlist:verify": "python3 scripts/verify_streams.py",
     "lint": "npx eslint \"scripts/**/*.{ts,js}\" \"tests/**/*.{ts,js}\"",
     "test": "npx vitest run --no-file-parallelism",
     "postinstall": "npm run api:load"
